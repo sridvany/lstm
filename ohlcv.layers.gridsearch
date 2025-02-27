@@ -1,0 +1,212 @@
+import os
+import datetime
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dropout, Dense
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+import matplotlib.pyplot as plt
+tf.get_logger().setLevel('ERROR')
+ANALIZ_BASLANGIC_ZAMANI = datetime.datetime.now()
+print("Analiz Başlangıç Zamanı:", ANALIZ_BASLANGIC_ZAMANI)
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 1000)
+
+# -----------------------------------------------------------
+# 1. Orijinal Veri Çekme, Temizleme ve Saklama İşlemleri
+# -----------------------------------------------------------
+def get_stock_data(stock_symbols, start_date, end_date):
+    data_dict = {}
+    for symbol in stock_symbols:
+        print(f"Processing data for {symbol}")
+        stock_data = yf.download(f'{symbol}.IS', start=start_date, end=end_date)
+        # Sıfırları NaN'a çevir ve eksik verileri temizle
+        stock_data.replace(0, np.nan, inplace=True)
+        stock_data.dropna(inplace=True)
+        data_dict[symbol] = stock_data.copy()
+    return data_dict
+
+# -----------------------------------------------------------
+# 2. Veri İşleme Fonksiyonları
+# -----------------------------------------------------------
+def train_val_test_split(data, train_ratio=0.7, val_ratio=0.15):
+    n = len(data)
+    train_end = int(n * train_ratio)
+    val_end = train_end + int(n * val_ratio)
+    train = data.iloc[:train_end]
+    val = data.iloc[train_end:val_end]
+    test = data.iloc[val_end:]
+    return train, val, test
+
+def split_features_target(df):
+    X = df.drop(['Close'], axis=1).values
+    y = df['Close'].values.reshape(-1, 1)
+    return X, y
+
+def create_sequences(X, y, window_size):
+    Xs, ys = [], []
+    for i in range(len(X) - window_size):
+        Xs.append(X[i:i + window_size])
+        ys.append(y[i + window_size])
+    return np.array(Xs), np.array(ys)
+
+# -----------------------------------------------------------
+# 3. Modeli oluşturan fonksiyon
+# -----------------------------------------------------------
+def build_model(input_shape, num_layers, units, learning_rate, dropout_rate=0.2):
+    model = Sequential()
+    model.add(tf.keras.Input(shape=input_shape))
+    model.add(LSTM(units, return_sequences=(num_layers > 1)))
+    model.add(Dropout(dropout_rate))
+
+    for i in range(1, num_layers - 1):
+        model.add(LSTM(units, return_sequences=True))
+        model.add(Dropout(dropout_rate))
+
+    if num_layers > 1:
+        model.add(LSTM(units, return_sequences=False))
+        model.add(Dropout(dropout_rate))
+
+    model.add(Dense(1))
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss='mse')
+    return model
+
+# -----------------------------------------------------------
+# 4. Ana program: Tüm hisse ve tüm hiperparametre kombinasyonları için sonuçları listele
+# -----------------------------------------------------------
+def main():
+    stock_symbols = ['AKBNK', 'YKBNK']
+    start_date = '2022-01-01'
+    end_date = '2025-01-01'
+    stock_data_dict = get_stock_data(stock_symbols, start_date, end_date)
+
+    # Hiperparametre Grid'i
+    learning_rates = [0.01, 0.001, 0.0001]
+    batch_sizes = [32, 64, 96]
+    window_sizes = [30, 60, 90]
+    units_list = [64, 128, 256]
+    epochs = 150
+    patience = 15
+
+    # Tüm sonuçları saklamak için liste
+    results = []
+
+    for symbol in stock_symbols:
+        print(f"\n----- İşleniyor: {symbol} -----")
+        data = stock_data_dict[symbol]
+
+        # Veri seti bölme
+        train_df, val_df, test_df = train_val_test_split(data)
+
+        # Hangi sütunların X olarak kullanılacağını yazdır (Close hariç)
+        features = list(train_df.columns.drop('Close'))
+        print(f"{symbol} için kullanılan özellikler (X): {features}")
+
+        # Özellik ve hedef ayrımı
+        X_train, y_train = split_features_target(train_df)
+        X_val, y_val = split_features_target(val_df)
+        X_test, y_test = split_features_target(test_df)
+
+        # Ölçekleme
+        scaler_X = MinMaxScaler()
+        scaler_y = MinMaxScaler()
+        X_train_scaled = scaler_X.fit_transform(X_train)
+        X_val_scaled = scaler_X.transform(X_val)
+        X_test_scaled = scaler_X.transform(X_test)
+        y_train_scaled = scaler_y.fit_transform(y_train)
+        y_val_scaled = scaler_y.transform(y_val)
+        y_test_scaled = scaler_y.transform(y_test)
+
+        # Grid search: Her katman sayısı için
+        for num_layers in range(1, 6):
+            print(f"\n{symbol} - {num_layers} Katmanlı Model için Grid Search")
+            total_combinations = len(learning_rates) * len(batch_sizes) * len(window_sizes) * len(units_list)
+            counter = 0
+
+            for lr in learning_rates:
+                for bs in batch_sizes:
+                    for ws in window_sizes:
+                        for units in units_list:
+                            counter += 1
+                            remaining = total_combinations - counter + 1
+                            print(f"Kalan analiz sayısı: {remaining}")
+
+                            # Sequence oluşturma
+                            X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_scaled, ws)
+                            X_val_seq, y_val_seq = create_sequences(X_val_scaled, y_val_scaled, ws)
+                            X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test_scaled, ws)
+
+                            input_shape = (ws, X_train_scaled.shape[1])
+
+                            try:
+                                model = build_model(input_shape, num_layers, units, lr)
+                                early_stop = EarlyStopping(monitor='val_loss', patience=patience,
+                                                           restore_best_weights=True)
+
+                                model.fit(X_train_seq, y_train_seq,
+                                          epochs=epochs,
+                                          batch_size=bs,
+                                          validation_data=(X_val_seq, y_val_seq),
+                                          callbacks=[early_stop],
+                                          verbose=0)
+
+                                # Tahminler
+                                predictions_scaled = model.predict(X_test_seq, verbose=0)
+                                predictions_original = scaler_y.inverse_transform(predictions_scaled)
+                                y_test_original = scaler_y.inverse_transform(y_test_seq)
+
+                                # Metrikleri hesapla
+                                r2 = r2_score(y_test_original, predictions_original)
+                                rmse = np.sqrt(mean_squared_error(y_test_seq, predictions_scaled))
+                                mae = mean_absolute_error(y_test_seq, predictions_scaled)
+                                mape = np.mean(np.abs((y_test_seq - predictions_scaled) / y_test_seq)) * 100
+
+                                print(f"Katman: {num_layers}, LR: {lr}, BS: {bs}, WS: {ws}, Units: {units}, R²: {r2:.4f}, RMSE: {rmse:.4f}, MAE: {mae:.4f}, MAPE: {mape:.2f}%")
+
+                                # Her denemenin sonuçlarını ekle
+                                results.append({
+                                    "stock": symbol,
+                                    "num_layers": num_layers,
+                                    "learning_rate": lr,
+                                    "batch_size": bs,
+                                    "window_size": ws,
+                                    "units": units,
+                                    "r2": r2,
+                                    "rmse": rmse,
+                                    "mae": mae,
+                                    "mape": mape
+                                })
+                            except Exception as e:
+                                print(f"Hata: {e}")
+                                continue
+
+    # Tüm sonuçları DataFrame olarak göster
+    results_df = pd.DataFrame(results)
+    print("\nTüm Hisseler İçin Hiperparametrelerle Birlikte Tüm Sonuçlar (R², RMSE, MAE, MAPE):")
+    print(results_df.to_string(index=False))
+
+    sorted_results = results_df.sort_values('r2', ascending=False)
+    print("\nTüm Sonuçlar (Sadece R²'ye Göre Sıralı):")
+    print(sorted_results.to_string(index=False))
+
+    # En iyi sonucu görselleştirme (örnek)
+    if not results_df.empty:
+        plt.figure(figsize=(10, 6))
+        for stock in results_df['stock'].unique():
+            subset = results_df[results_df['stock'] == stock]
+            plt.plot(subset['num_layers'], subset['r2'], marker='o', linestyle='-', label=stock)
+        plt.xlabel('Katman Sayısı')
+        plt.ylabel('R² Değeri')
+        plt.title('Hisselere Göre Katman Sayısına Bağlı R² Değerleri')
+        plt.legend()
+        plt.show()
+
+if __name__ == "__main__":
+    main()
